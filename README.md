@@ -1,8 +1,8 @@
 # AgentWorkflow memory leak reproduction
 
-`AgentWorkflow.run()` pins per-request objects (~30-60 MB) in memory for the duration of the workflow timeout (default 600s) via `ContextVar` + asyncio `TimerHandle` context snapshots.
+`AgentWorkflow.run()` permanently pins per-request objects (~30-60 MB) in memory when combined with periodic asyncio timers (like aiohttp's `TCPConnector._cleanup_closed`).
 
-Not a permanent leak — objects are released when the timer fires. But under sustained load (1 req/s), steady state = 600 × 30-60 MB = 18-36 GB → OOM.
+Root cause: CPython's `Handle._run()` executes the callback inside the handle's own `_context`. When a periodic timer re-registers via `call_at()`, the new `copy_context()` copies the running context — which contains `_current_run` → `RunContext` → `AgentWorkflow`. The value is inherited forever.
 
 ## Run
 
@@ -13,22 +13,24 @@ uv run python repro.py
 ## Output
 
 ```
-Part 1: 600s timer — objects pinned until timer fires
+Part 1: one-shot 3s timer — released after timer fires
 -------------------------------------------------------
-  After 10 requests: 10 AgentWorkflow pinned
-  After 20 requests: 20 AgentWorkflow pinned
-  After 30 requests: 30 AgentWorkflow pinned
-  After 40 requests: 40 AgentWorkflow pinned
-  After 50 requests: 50 AgentWorkflow pinned
+  Immediately: 10 AgentWorkflow pinned
+  After 5s:    0 AgentWorkflow (released)
 
-  At 1 req/s steady state: 600 × ~30-60 MB = 18-36 GB → OOM
-
-Part 2: 2s timer — proving objects are released after timer fires
+Part 2: periodic timer — PERMANENT leak
 -------------------------------------------------------
-  Immediately after: 10 AgentWorkflow pinned
-  After 3s (timer fired): 0 AgentWorkflow pinned
+  (simulates aiohttp TCPConnector._cleanup_closed)
 
-  Confirmed: not a permanent leak, but 600s retention under load = OOM.
+  Immediately:  10 AgentWorkflow pinned
+  After 5s:     10 AgentWorkflow STILL pinned
+  After 10s:    10 AgentWorkflow STILL pinned (permanent)
+
+  Why permanent: CPython Handle._run() executes callback in the
+  handle's own Context. Periodic re-register copies that Context,
+  inheriting RunContext → AgentWorkflow forever.
+
+  After cancel: 1 AgentWorkflow (freed)
 ```
 
 ## Issue
