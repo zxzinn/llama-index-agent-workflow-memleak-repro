@@ -676,8 +676,8 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "llama-index-core", specifier = ">=0.14.20" },
-    { name = "llama-index-workflows", specifier = ">=2.17.1" },
+    { name = "llama-index-core", specifier = "==0.14.20" },
+    { name = "llama-index-workflows", specifier = "==2.17.1" },
 ]
 
 [[package]]
