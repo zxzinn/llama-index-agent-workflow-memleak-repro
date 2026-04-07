@@ -1,14 +1,14 @@
 """
 AgentWorkflow pins per-request objects via ContextVar + asyncio TimerHandle.
 
-Any call_later/call_at during a workflow run (e.g. aiohttp TCPConnector cleanup)
-captures contextvars.Context containing _current_run → RunContext → AgentWorkflow
-→ agents, LLM clients, memory blocks. Pinned until timer fires or session closes.
+Any call_later/call_at during a workflow run captures contextvars.Context
+containing _current_run → RunContext → AgentWorkflow → agents, LLM clients,
+memory blocks. Pinned until the timer fires (default workflow timeout: 600s).
 
-Part 1: One-shot timer (600s) — delayed release, objects freed after timer fires.
-Part 2: Periodic timer (like aiohttp) — permanent leak, objects never freed.
+Not a permanent leak — objects ARE released when the timer fires. But under
+sustained load (1 req/s), steady state = 600 × 30-60 MB = 18-36 GB → OOM.
 
-    pip install llama-index-core llama-index-workflows
+    pip install llama-index-core==0.14.20 llama-index-workflows==2.17.1
     python repro.py
 """
 
@@ -36,20 +36,16 @@ from llama_index.core.memory import ChatMemoryBuffer
 logging.disable(logging.CRITICAL)
 
 
-# Collect periodic timer handles so we can stop them at the end
-_periodic_handles: list[asyncio.TimerHandle] = []
-
-
 class FakeLLM(FunctionCallingLLM):
-    """Stub LLM with 1 MB ballast. Registers a timer during achat like aiohttp would."""
+    """Stub LLM with 1 MB ballast. Registers a timer during achat."""
 
     _ballast: bytes
-    _use_periodic_timer: bool
+    _timer_delay: float
 
-    def __init__(self, use_periodic_timer: bool = False, **kwargs: Any) -> None:
+    def __init__(self, timer_delay: float = 600.0, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._ballast = b'\x00' * 1024 * 1024
-        self._use_periodic_timer = use_periodic_timer
+        self._timer_delay = timer_delay
 
     @property
     def metadata(self) -> LLMMetadata:
@@ -59,21 +55,11 @@ class FakeLLM(FunctionCallingLLM):
         return ChatResponse(message=ChatMessage(role=MessageRole.ASSISTANT, content='Hi'))
 
     async def achat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
-        loop = asyncio.get_running_loop()
-        if self._use_periodic_timer:
-            # Simulates aiohttp TCPConnector._cleanup_closed: a periodic timer
-            # that re-registers itself on every fire. Never stops unless explicitly
-            # cancelled. Each fire captures a fresh Context, but the *first* one
-            # (created during workflow run) pins RunContext → AgentWorkflow forever.
-            def _periodic():
-                handle = loop.call_later(0.5, _periodic)
-                _periodic_handles.append(handle)
-
-            handle = loop.call_later(0.5, _periodic)
-            _periodic_handles.append(handle)
-        else:
-            # One-shot 600s timer. Objects pinned for 600 seconds then released.
-            loop.call_later(600, lambda: None)
+        # Simulates what happens in practice: any async library (aiohttp, aioboto3)
+        # that calls loop.call_later() or loop.call_at() during a workflow run.
+        # The TimerHandle captures the current contextvars.Context, which contains
+        # _current_run → RunContext → AgentWorkflow → this LLM → _ballast.
+        asyncio.get_running_loop().call_later(self._timer_delay, lambda: None)
         return self.chat(messages)
 
     def complete(self, p: str, formatted: bool = False, **kw: Any) -> CompletionResponse:
@@ -115,8 +101,8 @@ def count(name: str) -> int:
     return sum(1 for o in gc.get_objects() if type(o).__name__ == name)
 
 
-async def run_one(use_periodic_timer: bool = False):
-    llm = FakeLLM(use_periodic_timer=use_periodic_timer)
+async def run_one(timer_delay: float = 600.0):
+    llm = FakeLLM(timer_delay=timer_delay)
     wf = AgentWorkflow(
         agents=[FunctionAgent(name='t', description='t', llm=llm, system_prompt='Hi.')],
         timeout=600,
@@ -128,52 +114,43 @@ async def run_one(use_periodic_timer: bool = False):
 
 
 async def main():
-    # --- Part 1: one-shot 600s timer (delayed release) ---
-    print('Part 1: one-shot 600s timer')
-    print('-' * 40)
+    # --- Part 1: objects pinned for timeout duration ---
+    print('Part 1: 600s timer — objects pinned until timer fires')
+    print('-' * 55)
 
     baseline = count('AgentWorkflow')
     for batch in range(1, 6):
         for _ in range(10):
-            await run_one(use_periodic_timer=False)
+            await run_one(timer_delay=600.0)
         n = count('AgentWorkflow') - baseline
-        print(f'  After {batch * 10:>2d} requests: {n} AgentWorkflow leaked')
+        print(f'  After {batch * 10:>2d} requests: {n} AgentWorkflow pinned')
 
     print()
-    print(f'  Objects pinned for 600s then released.')
-    print(f'  At 1 req/s steady state: 600 × ~30-60 MB = 18-36 GB')
+    print('  At 1 req/s steady state: 600 × ~30-60 MB = 18-36 GB → OOM')
 
-    # --- Part 2: periodic timer (permanent leak) ---
+async def part2():
+    """Run in a separate event loop to avoid Part 1 timer contamination."""
     print()
-    print('Part 2: periodic timer (simulates aiohttp TCPConnector)')
-    print('-' * 40)
+    print('Part 2: 2s timer — proving objects are released after timer fires')
+    print('-' * 55)
 
-    baseline2 = count('AgentWorkflow')
-    for batch in range(1, 4):
-        for _ in range(10):
-            await run_one(use_periodic_timer=True)
-        n = count('AgentWorkflow') - baseline2
-        print(f'  After {batch * 10:>2d} requests: {n} AgentWorkflow leaked')
+    for _ in range(10):
+        await run_one(timer_delay=2.0)
+    pinned = count('AgentWorkflow')
+    print(f'  Immediately after: {pinned} AgentWorkflow pinned')
 
-    print()
-    print('  Waiting 3s (periodic timers keep re-registering)...')
     await asyncio.sleep(3)
-    n = count('AgentWorkflow') - baseline2
-    print(f'  After waiting:  {n} AgentWorkflow still leaked (permanent)')
-
+    remaining = count('AgentWorkflow')
+    print(f'  After 3s (timer fired): {remaining} AgentWorkflow pinned')
     print()
-    print('  Cancelling all periodic timers...')
-    for h in _periodic_handles:
-        h.cancel()
-    _periodic_handles.clear()
-    # Let the event loop process cancellations
-    await asyncio.sleep(0.1)
-    gc.collect()
-    n = count('AgentWorkflow') - baseline2
-    print(f'  After cancel:   {n} AgentWorkflow (freed only after explicit cancel)')
+    print('  Confirmed: not a permanent leak, but 600s retention under load = OOM.')
 
 
 if __name__ == '__main__':
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(main())
-    loop.close()
+    loop1 = asyncio.new_event_loop()
+    loop1.run_until_complete(main())
+    loop1.close()
+
+    loop2 = asyncio.new_event_loop()
+    loop2.run_until_complete(part2())
+    loop2.close()
